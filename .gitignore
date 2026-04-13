@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch & HF Checkpoints
+kanana-safeguard-finetuned-*/
+*.pt
+*.pth
+*.ckpt
+
+# Virtual environments
+venv/
+env/
+.env
+
+# DB and Data
+data/
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
