@@ -30,7 +30,7 @@ def main():
         # ======================================================================
         
         # [데이터 준비]: 0(UNSAFE) 라벨 250개, 1(SAFE) 라벨 250개 랜덤 추출 (총 500개)
-        df = pd.read_csv("./data/dataset-v1.0.csv")
+        df = pd.read_csv(f"./data/dataset-{args.dataset_version}.csv")
         df_safe = df[df['label'] == 1].sample(n=250, random_state=42)
         df_unsafe = df[df['label'] == 0].sample(n=250, random_state=42)
         
@@ -38,8 +38,8 @@ def main():
         test_df = pd.concat([df_safe, df_unsafe]).sample(frac=1, random_state=42).reset_index(drop=True)
 
         # [모델 및 토크나이저 로딩]
-        # 학습이 완료되어 저장된 ./kanana-safeguard-finetuned-v1.0 폴더에서 튜닝된 가중치를 불러옵니다.
-        model_path = "./kanana-safeguard-finetuned-v1.0"
+        # 학습이 완료되어 저장된 ./model/kanana-safeguard-finetuned-{version} 폴더에서 불러옵니다.
+        model_path = f"./model/kanana-safeguard-finetuned-{args.version}"
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         model = AutoModelForCausalLM.from_pretrained(
