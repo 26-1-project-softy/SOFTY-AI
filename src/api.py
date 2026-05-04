@@ -5,8 +5,12 @@ import datetime
 import uuid
 import subprocess
 import httpx
+import os
+from dotenv import load_dotenv
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+load_dotenv()  # .env 파일 로드
 
 import database
 
@@ -78,8 +82,8 @@ async def get_training_job_status(job_id: Optional[str] = None):
     if job_id:
         cursor.execute("SELECT * FROM training_jobs WHERE job_id = ?", (job_id,))
     else:
-        # ID가 없는 경우 가장 최근 학습 이력 1건 조회 (삽입 순서대로 정렬)
-        cursor.execute("SELECT * FROM training_jobs ORDER BY ROWID DESC LIMIT 1")
+        # ID가 없는 경우 가장 최근 '성공한(completed)' 학습 이력 1건 조회
+        cursor.execute("SELECT * FROM training_jobs WHERE status = 'completed' ORDER BY ROWID DESC LIMIT 1")
         
     row = cursor.fetchone()
     conn.close()
@@ -93,6 +97,7 @@ async def get_training_job_status(job_id: Optional[str] = None):
         "result_code": 200,
         "result_msg": "success",
         "job_id": row["job_id"],
+        "dataset_version": row["dataset_version"],
         "status": row["status"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
@@ -133,13 +138,13 @@ async def request_retraining_job(req: RetrainingRequest):
     # 확장된 컬럼에 재학습 정보 삽입
     cursor.execute("""
         INSERT INTO training_jobs (
-            job_id, job_type, base_version, from_date, to_date, 
+            job_id, job_type, dataset_version, base_version, from_date, to_date, 
             include_feedback, retraining_reason, status,
             epoch, batch_size, learning_rate
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        job_id, 'retrain', req.base_version, req.from_date, req.to_date,
+        job_id, 'retrain', f"{req.base_version}-fb-data", req.base_version, req.from_date, req.to_date,
         req.include_feedback, req.retraining_reason, "queued",
         req.epoch, req.batch_size, req.learning_rate
     ))
@@ -270,7 +275,7 @@ class InferenceRequest(BaseModel):
 async def infer_risk_detection(req: InferenceRequest):
     import subprocess
     
-    print("[추론 API] AWS 추론 요청 수신. 공용 서버 정책에 따라 단발성 스크립트를 띄웁니다...")
+    print("[추론 API] 추론 요청 수신. 공용 서버 정책에 따라 단발성 스크립트를 띄웁니다...")
     
     # inference_worker.py를 subprocess로 실행하여 모델을 켜고, 끝나면 OS가 즉시 메모리를 해제함.
     proc = subprocess.run(
@@ -294,8 +299,8 @@ async def infer_risk_detection(req: InferenceRequest):
 # 7. 외부 거대언어모델(LLM) API 연동 추론
 # =========================================
 
-EXTERNAL_API_URL = "http://cellm.gachon.ac.kr:8080/v1/chat/completions"
-TEAM_KEY = "sk-vllm-645c87709ebff5cfab38355f"
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "http://cellm.gachon.ac.kr:8080/v1/chat/completions")
+TEAM_KEY = os.getenv("TEAM_KEY")
 
 class RecommendRequest(BaseModel):
     content: str
