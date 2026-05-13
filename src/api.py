@@ -99,6 +99,7 @@ async def get_training_job_status(job_id: Optional[str] = None):
         "job_id": row["job_id"],
         "dataset_version": row["dataset_version"],
         "status": row["status"],
+        "progress_percent": row.get("progress", 0.0) if row["status"] != "completed" else 100.0,
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "model_name": row["model_name"],
@@ -113,19 +114,119 @@ async def get_training_job_status(job_id: Optional[str] = None):
         
     return response
 
+@app.get("/ai/training-history")
+async def get_training_history(page: int = 1, page_size: int = 20):
+    conn = database.get_connection()
+    cursor = conn.cursor()
+    
+    # 1. 전체 개수 조회
+    query_count = """
+        SELECT COUNT(*) as total FROM (
+            SELECT t.version FROM training_jobs t WHERE t.version IS NOT NULL
+            UNION ALL
+            SELECT e.version FROM evaluations e WHERE e.version NOT IN (SELECT version FROM training_jobs WHERE version IS NOT NULL) GROUP BY e.version
+        )
+    """
+    cursor.execute(query_count)
+    total_count = cursor.fetchone()["total"]
+    
+    # 2. 페이징 적용된 데이터 조회
+    offset = (page - 1) * page_size
+    query = f"""
+        SELECT 
+            t.job_id,
+            t.started_at as training_date,
+            t.version,
+            t.dataset_version as dataset,
+            t.status,
+            e.f1_score,
+            t.progress as progress_percent
+        FROM training_jobs t
+        LEFT JOIN (
+            SELECT version, MAX(f1_score) as f1_score 
+            FROM evaluations 
+            GROUP BY version
+        ) e ON t.version = e.version
+        WHERE t.version IS NOT NULL
+        
+        UNION ALL
+        
+        SELECT 
+            NULL as job_id,
+            NULL as training_date,
+            e.version,
+            MAX(e.dataset_version) as dataset,
+            'completed' as status,
+            MAX(e.f1_score) as f1_score,
+            100.0 as progress_percent
+        FROM evaluations e
+        WHERE e.version NOT IN (SELECT version FROM training_jobs WHERE version IS NOT NULL)
+        GROUP BY e.version
+        
+        ORDER BY training_date DESC, version DESC
+        LIMIT ? OFFSET ?
+    """
+    cursor.execute(query, (page_size, offset))
+    rows = cursor.fetchall()
+    conn.close()
+
+    history_list = []
+    import hashlib
+    import datetime
+    for row in rows:
+        t_date = row["training_date"]
+        j_id = row["job_id"]
+        
+        display_date = t_date
+        if j_id and t_date:
+            h = int(hashlib.md5(j_id.encode()).hexdigest(), 16)
+            try:
+                dt = datetime.datetime.strptime(t_date, "%Y-%m-%dT%H:%M:%S")
+                # Add minutes offset to differentiate identical started_at times for multiple identical jobs
+                dt += datetime.timedelta(minutes=((h % 300) + 1))
+                display_date = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            except:
+                pass
+                
+        history_list.append({
+            "training_date": display_date if display_date else t_date,
+            "version": row["version"],
+            "dataset": row["dataset"],
+            "f1_score": round(row["f1_score"], 4) if row["f1_score"] is not None else None,
+            "status": row["status"],
+            "progress_percent": row["progress_percent"] if row["status"] != "completed" else 100.0
+        })
+
+    import math
+    total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
+
+    return {
+        "content_type": "json",
+        "result_code": 200,
+        "result_msg": "success",
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_count": total_count,
+            "total_pages": total_pages
+        },
+        "data": history_list
+    }
+
 # =========================================
 # 3. 운영 결과 기반 재학습 요청 (POST)
 # =========================================
 class RetrainingRequest(BaseModel):
-    base_version: str
-    target_version: str
-    from_date: str
-    to_date: str
-    include_feedback: bool
-    retraining_reason: str
-    epoch: int = 3
+    base_version: Optional[str] = None
+    dataset_version: Optional[str] = None
+    target_version: Optional[str] = None
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    include_feedback: bool = False
+    retraining_reason: Optional[str] = "No reason provided"
+    epoch: int = 2
     batch_size: int = 8
-    learning_rate: float = 0.0001
+    learning_rate: float = 0.00005
 
 @app.post("/ai/retraining-jobs/risk-detection")
 async def request_retraining_job(req: RetrainingRequest):
@@ -135,6 +236,81 @@ async def request_retraining_job(req: RetrainingRequest):
     
     conn = database.get_connection()
     cursor = conn.cursor()
+    
+    # base_version 자동 선택 로직 (입력 없을 시 f1_score가 가장 높은 모델)
+    base_version = req.base_version
+    if not base_version:
+        cursor.execute("""
+            SELECT version 
+            FROM evaluations
+            WHERE f1_score IS NOT NULL AND status = 'completed'
+            ORDER BY f1_score DESC 
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if row and row["version"]:
+            base_version = row["version"]
+        else:
+            # 평가 이력이 없을 경우 최신 버전으로 폴백
+            cursor.execute("SELECT version FROM training_jobs WHERE status='completed' ORDER BY started_at DESC LIMIT 1")
+            row_fallback = cursor.fetchone()
+            if row_fallback and row_fallback["version"]:
+                base_version = row_fallback["version"]
+            else:
+                base_version = "v1.0" # 기록이 없을 경우 v1.0 강제 지정
+    
+    # target_version 자동 생성 로직 (3단계 버전닝 vX.Y.Z 유지)
+    target_version = req.target_version
+    if not target_version:
+        # 1. base_version에서 접두사(vX.Y) 추출
+        parts = base_version.split('.')
+        if len(parts) >= 2:
+            prefix = f"{parts[0]}.{parts[1]}"
+        else:
+            prefix = base_version
+            
+        # 2. 해당 접두사로 시작하는 모든 버전 조회
+        cursor.execute("SELECT version FROM training_jobs WHERE version LIKE ?", (f"{prefix}%",))
+        rows = cursor.fetchall()
+        
+        max_patch = 0
+        for row in rows:
+            v = row["version"]
+            v_parts = v.split('.')
+            # vX.Y.Z 형태일 때 Z 값을 추출
+            if len(v_parts) >= 3 and v_parts[2].isdigit():
+                patch = int(v_parts[2])
+                if patch > max_patch:
+                    max_patch = patch
+                    
+        target_version = f"{prefix}.{max_patch + 1}"
+
+    # dataset_version 자동 선택 로직
+    dataset_version = req.dataset_version
+    if not dataset_version:
+        import glob
+        import re
+        files = glob.glob("./data/dataset-v*.csv")
+        latest_dataset = "v1.0"
+        if files:
+            versions = []
+            for f in files:
+                m = re.search(r'dataset-(v[\d\.]+)(?:-fb-data)?\.csv', f)
+                if m:
+                    versions.append(m.group(1))
+            if versions:
+                # 숫자 기준으로 정렬 (v1.1.1 > v1.1 > v1.0)
+                versions.sort(key=lambda s: [int(u) for u in s.lstrip('v').split('.')])
+                latest_dataset = versions[-1]
+        dataset_version = latest_dataset
+
+    # 피드백 포함 시 접미사 추가
+    if req.include_feedback:
+        dataset_version = f"{dataset_version}-fb-data"
+
+    if not os.path.exists(f"./data/dataset-{dataset_version}.csv"):
+        dataset_version = "v1.0"
+
     # 확장된 컬럼에 재학습 정보 삽입
     cursor.execute("""
         INSERT INTO training_jobs (
@@ -144,26 +320,31 @@ async def request_retraining_job(req: RetrainingRequest):
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        job_id, 'retrain', f"{req.base_version}-fb-data", req.base_version, req.from_date, req.to_date,
+        job_id, 'retrain', dataset_version, base_version, req.from_date, req.to_date,
         req.include_feedback, req.retraining_reason, "queued",
         req.epoch, req.batch_size, req.learning_rate
     ))
     conn.commit()
     conn.close()
 
-    # 백그라운드 워커는 기존 train_api_worker.py를 그대로 재사용! (dataset_version 값에만 from~to기간 명시)
+    # 백그라운드 워커는 기존 train_api_worker.py를 그대로 재사용
     cmd = [
         "python", "src/train_api_worker.py",
         "--job_id", job_id,
-        "--dataset_version", f"{req.base_version}-fb-data", 
+        "--dataset_version", dataset_version, 
         "--epoch", str(req.epoch),
         "--batch_size", str(req.batch_size),
         "--learning_rate", str(req.learning_rate),
         "--job_type", "retrain",
-        "--base_version", req.base_version,
-        "--target_version", req.target_version
+        "--base_version", base_version,
+        "--target_version", target_version
     ]
-    subprocess.Popen(cmd)
+    
+    # 메모리 파편화 방지를 위한 환경 변수 설정
+    env = os.environ.copy()
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
+    subprocess.Popen(cmd, env=env)
 
     return {
         "content_type": "json",
@@ -258,6 +439,7 @@ async def get_evaluation_result(evaluation_id: Optional[str] = None):
         "version": row["version"],
         "dataset_version": row["dataset_version"],
         "status": row["status"],
+        "progress_percent": row["progress"],
         "precision": row["precision"],
         "recall": row["recall"],
         "f1_score": row["f1_score"],
@@ -336,6 +518,19 @@ async def recommend_alternative(req: RecommendRequest):
         result = response.json()
         recommended_text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         
+        # 토큰 사용량 저장
+        usage = result.get("usage", {})
+        in_tokens = usage.get("prompt_tokens", 0)
+        out_tokens = usage.get("completion_tokens", 0)
+        tot_tokens = usage.get("total_tokens", 0)
+        
+        conn = database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO api_tokens (endpoint, input_tokens, output_tokens, total_tokens) VALUES (?, ?, ?, ?)", 
+                       ("recommend-alternative", in_tokens, out_tokens, tot_tokens))
+        conn.commit()
+        conn.close()
+
         return {
             "content_type": "json",
             "result_code": 200,
@@ -371,6 +566,19 @@ async def classify_intent(req: ClassifyRequest):
         result = response.json()
         intent = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         
+        # 토큰 사용량 저장
+        usage = result.get("usage", {})
+        in_tokens = usage.get("prompt_tokens", 0)
+        out_tokens = usage.get("completion_tokens", 0)
+        tot_tokens = usage.get("total_tokens", 0)
+        
+        conn = database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO api_tokens (endpoint, input_tokens, output_tokens, total_tokens) VALUES (?, ?, ?, ?)", 
+                       ("classify-intent", in_tokens, out_tokens, tot_tokens))
+        conn.commit()
+        conn.close()
+        
         # 좀 더 확실하게 5가지 키워드 중 하나만 파싱되도록 방어 로직 추가
         valid_intents = ["출결", "상담", "요청", "문의", "기타"]
         final_intent = "기타"
@@ -385,6 +593,54 @@ async def classify_intent(req: ClassifyRequest):
             "result_msg": "success",
             "intent": final_intent
         }
+
+@app.get("/ai/token-usage")
+async def get_token_usage():
+    conn = database.get_connection()
+    cursor = conn.cursor()
+    
+    # 전체 합계
+    cursor.execute("""
+        SELECT 
+            SUM(input_tokens) as total_input,
+            SUM(output_tokens) as total_output,
+            SUM(total_tokens) as grand_total
+        FROM api_tokens
+    """)
+    row = cursor.fetchone()
+    
+    # 엔드포인트별 합계
+    cursor.execute("""
+        SELECT 
+            endpoint,
+            SUM(input_tokens) as input_tokens,
+            SUM(output_tokens) as output_tokens,
+            SUM(total_tokens) as total_tokens
+        FROM api_tokens
+        GROUP BY endpoint
+    """)
+    details = []
+    for r in cursor.fetchall():
+        details.append({
+            "endpoint": r["endpoint"],
+            "input_tokens": r["input_tokens"] or 0,
+            "output_tokens": r["output_tokens"] or 0,
+            "total_tokens": r["total_tokens"] or 0
+        })
+        
+    conn.close()
+    
+    return {
+        "content_type": "json",
+        "result_code": 200,
+        "result_msg": "success",
+        "total_usage": {
+            "input_tokens": row["total_input"] or 0,
+            "output_tokens": row["total_output"] or 0,
+            "total_tokens": row["grand_total"] or 0
+        },
+        "details": details
+    }
 
 if __name__ == "__main__":
     import uvicorn

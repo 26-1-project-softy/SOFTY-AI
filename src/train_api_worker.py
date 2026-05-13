@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
+import gc
 
 class CustomHFTrainingDataset(Dataset):
     def __init__(self, df, tokenizer, max_length=512):
@@ -81,16 +82,16 @@ def main():
         if hasattr(model, "enable_input_require_grads"): model.enable_input_require_grads()
         if hasattr(model, "gradient_checkpointing_enable"): model.gradient_checkpointing_enable()
 
-        # 3. 전체 데이터 통째로 로딩 및 약점(Recall) 극복을 위한 오버샘플링
+        # 3. 전체 데이터 통째로 로딩 (UnSmile 데이터 추가로 오버샘플링 불필요)
         df_raw = pd.read_csv(f"./data/dataset-{args.dataset_version}.csv")
         
-        # UNSAFE(0) 데이터만 1.5배로 복제하여 모델이 치명적 위험을 더 자주 보게 함
-        df_unsafe = df_raw[df_raw['label'] == 0]
-        df_safe = df_raw[df_raw['label'] == 1]
-        df = pd.concat([df_unsafe, df_unsafe.sample(frac=0.5, random_state=42), df_safe]).sample(frac=1, random_state=42).reset_index(drop=True)
-        print(f"[{args.job_id}] 데이터 오버샘플링 완료: 총 데이터 수 {len(df)}개 (UNSAFE 비중 확대 적용)", flush=True)        
-        # 문맥 캔버스 길이를 128로 유지하여 어텐션(N^2) 연산 속도 16x 최적화 방어
-        full_dataset = CustomHFTrainingDataset(df, tokenizer, max_length=128)
+        # 전체 데이터 100% 셔플 (불필요한 2배 복제를 제거하여 학습 속도를 대폭 단축)
+        df = df_raw.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        
+        print(f"[{args.job_id}] 데이터 준비 완료: 총 데이터 수 {len(df)}개", flush=True)        
+        
+        # 문맥 캔버스 길이를 96으로 약간 줄여서 연산 속도 최적화 (대부분의 악플/문장은 짧음)
+        full_dataset = CustomHFTrainingDataset(df, tokenizer, max_length=96)
         
         train_size = int(0.9 * len(full_dataset))
         val_size = len(full_dataset) - train_size
@@ -128,21 +129,44 @@ def main():
                 
                 if (step + 1) % 100 == 0:
                     print(f"[Epoch {epoch+1}/{args.epoch}] Step: {step+1}/{len(train_loader)} - Loss: {loss.item() * accumulation:.4f}", flush=True)
+                    
+                    # Update progress in DB
+                    try:
+                        total_steps = len(train_loader) * args.epoch
+                        current_step = step + 1 + (epoch * len(train_loader))
+                        progress_pct = round((current_step / total_steps) * 100.0, 2)
+                        
+                        import sqlite3
+                        db_conn = sqlite3.connect('jobs.db', timeout=5)
+                        db_cursor = db_conn.cursor()
+                        db_cursor.execute("UPDATE training_jobs SET progress = ? WHERE job_id = ?", (progress_pct, args.job_id))
+                        db_conn.commit()
+                        db_conn.close()
+                    except Exception as e:
+                        print(f"[Progress Update Error] {e}")
                 
                 eval_steps = max(1, len(train_loader) // 4)
                 if (step + 1) % eval_steps == 0 or (step + 1) == len(train_loader):
                     model.eval()
                     val_loss = 0
-                    print(f"[검증] 중간 성능 평가 추론 중... (Step: {step+1})", flush=True)
+                    print(f"\n[검증] 중간 성능 평가 추론 중... (Step: {step+1})", flush=True)
+                    
+                    # 검증 전 메모리 파편화 정리
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
                     with torch.no_grad():
                         for val_batch in val_loader:
-                            val_outputs = model(
-                                input_ids=val_batch["input_ids"].to(device), 
-                                attention_mask=val_batch["attention_mask"].to(device), 
-                                labels=val_batch["labels"].to(device)
-                            )
-                            val_loss += val_outputs.loss.item()
+                            v_input_ids = val_batch['input_ids'].to(device)
+                            v_labels = val_batch['labels'].to(device)
+                            v_outputs = model(v_input_ids, labels=v_labels)
+                            val_loss += v_outputs.loss.item()
+                    
                     avg_val_loss = val_loss / len(val_loader)
+                    
+                    # 검증 후 메모리 파편화 정리
+                    torch.cuda.empty_cache()
+                    gc.collect()
                     
                     if avg_val_loss < best_val_loss:
                         best_val_loss = avg_val_loss
@@ -167,7 +191,7 @@ def main():
         created_version = args.target_version
         
         cursor.execute("""
-            UPDATE training_jobs SET status = 'completed', finished_at = ?, model_name = 'kanana-risk-detector', version = ? WHERE job_id = ?
+            UPDATE training_jobs SET status = 'completed', finished_at = ?, model_name = 'kanana-risk-detector', version = ?, progress = 100.0 WHERE job_id = ?
         """, (finished_str, created_version, args.job_id))
         conn.commit()
         print(f"[{args.job_id}] 실제 학습 워커 완료 및 DB 반영 성공", flush=True)

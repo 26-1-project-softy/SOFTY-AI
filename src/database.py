@@ -46,10 +46,23 @@ def init_db():
         version TEXT,
         dataset_version TEXT,
         status TEXT,
+        progress REAL DEFAULT 0.0,
         precision REAL,
         recall REAL,
         f1_score REAL,
         passed BOOLEAN
+    )
+    """)
+
+    # 3. 토큰 사용량 (Tokens) 테이블
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        total_tokens INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
