@@ -82,8 +82,8 @@ async def get_training_job_status(job_id: Optional[str] = None):
     if job_id:
         cursor.execute("SELECT * FROM training_jobs WHERE job_id = ?", (job_id,))
     else:
-        # ID가 없는 경우 가장 최근 '성공한(completed)' 학습 이력 1건 조회
-        cursor.execute("SELECT * FROM training_jobs WHERE status = 'completed' ORDER BY ROWID DESC LIMIT 1")
+        # ID가 없는 경우 가장 최근 학습 이력 1건 조회 (진행중/완료 무관)
+        cursor.execute("SELECT * FROM training_jobs ORDER BY ROWID DESC LIMIT 1")
         
     row = cursor.fetchone()
     conn.close()
@@ -99,7 +99,7 @@ async def get_training_job_status(job_id: Optional[str] = None):
         "job_id": row["job_id"],
         "dataset_version": row["dataset_version"],
         "status": row["status"],
-        "progress_percent": row.get("progress", 0.0) if row["status"] != "completed" else 100.0,
+        "progress_percent": dict(row).get("progress", 0.0) if row["status"] != "completed" else 100.0,
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "model_name": row["model_name"],
@@ -244,7 +244,7 @@ async def request_retraining_job(req: RetrainingRequest):
             SELECT version 
             FROM evaluations
             WHERE f1_score IS NOT NULL AND status = 'completed'
-            ORDER BY f1_score DESC 
+            ORDER BY ROUND(f1_score, 3) DESC, recall DESC, ROWID DESC 
             LIMIT 1
         """)
         row = cursor.fetchone()

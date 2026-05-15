@@ -82,13 +82,17 @@ def main():
         if hasattr(model, "enable_input_require_grads"): model.enable_input_require_grads()
         if hasattr(model, "gradient_checkpointing_enable"): model.gradient_checkpointing_enable()
 
-        # 3. 전체 데이터 통째로 로딩 (UnSmile 데이터 추가로 오버샘플링 불필요)
+        # 3. 전체 데이터 통째로 로딩
         df_raw = pd.read_csv(f"./data/dataset-{args.dataset_version}.csv")
         
-        # 전체 데이터 100% 셔플 (불필요한 2배 복제를 제거하여 학습 속도를 대폭 단축)
-        df = df_raw.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        if args.job_type == "retrain":
+            print(f"[{args.job_id}] 재학습 모드: 학습 속도 향상을 위해 전체 데이터의 20%만 무작위 추출하고 Hard Negative Mining(OHEM)을 적용합니다.", flush=True)
+            df = df_raw.sample(frac=0.2, random_state=42).reset_index(drop=True)
+        else:
+            # 전체 데이터 100% 셔플
+            df = df_raw.sample(frac=1.0, random_state=42).reset_index(drop=True)
         
-        print(f"[{args.job_id}] 데이터 준비 완료: 총 데이터 수 {len(df)}개", flush=True)        
+        print(f"[{args.job_id}] 데이터 준비 완료: 총 학습 대상 데이터 수 {len(df)}개", flush=True)        
         
         # 문맥 캔버스 길이를 96으로 약간 줄여서 연산 속도 최적화 (대부분의 악플/문장은 짧음)
         full_dataset = CustomHFTrainingDataset(df, tokenizer, max_length=96)
@@ -120,8 +124,17 @@ def main():
                     attention_mask=batch["attention_mask"].to(device), 
                     labels=batch["labels"].to(device)
                 )
+                
+                # [Hard Negative Mining - OHEM]
+                # 재학습 시, 손실(Loss)이 0.1 미만인 '너무 쉬운(Easy)' 데이터는 역전파를 생략하여 속도를 대폭 향상
+                is_hard = True
+                if args.job_type == "retrain" and outputs.loss.item() < 0.1:
+                    is_hard = False
+                    
                 loss = outputs.loss / accumulation
-                loss.backward()
+                
+                if is_hard:
+                    loss.backward()
                 
                 if (step + 1) % accumulation == 0:
                     optimizer.step()
