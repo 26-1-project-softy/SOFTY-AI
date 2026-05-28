@@ -1,3 +1,5 @@
+import os
+import time
 import argparse
 import database
 import pandas as pd
@@ -22,6 +24,16 @@ def main():
             WHERE evaluation_id = ?
         """, (args.evaluation_id,))
         conn.commit()
+        
+        # [GPU 자원 관리] 학습 프로세스에 자원 양보 요청 (Lock)
+        LOCK_DIR = ".gpu_locks"
+        if not os.path.exists(LOCK_DIR): os.makedirs(LOCK_DIR)
+        lock_file = os.path.join(LOCK_DIR, f"lock_{args.evaluation_id}")
+        with open(lock_file, "w") as f:
+            f.write(args.evaluation_id)
+            
+        print(f"[{args.evaluation_id}] ⚠️ 학습 프로세스에 GPU 자원 양보를 요청했습니다. (2초 대기)")
+        time.sleep(2.0) # 학습 프로세스가 CPU로 이동할 시간을 벌어줌
 
         print(f"[{args.evaluation_id}] 실제 파이토치 모델 성능 평가(Evaluation) 워커 시작")
 
@@ -125,6 +137,11 @@ def main():
         print(f"[{args.evaluation_id}] 평가 중 에러 발생: {e}")
 
     finally:
+        # [GPU 자원 관리] 락 해제 (학습 프로세스 재개 허용)
+        lock_file = os.path.join(".gpu_locks", f"lock_{args.evaluation_id}")
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+            print(f"[{args.evaluation_id}] ✅ GPU 자원 점유 해제 및 락 파일을 제거했습니다.")
         conn.close()
 
 if __name__ == "__main__":

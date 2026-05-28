@@ -4,10 +4,13 @@ import datetime
 import database
 import pandas as pd
 import torch
+import os
+import sys
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
 import gc
+import sqlite3
 
 class CustomHFTrainingDataset(Dataset):
     def __init__(self, df, tokenizer, max_length=512):
@@ -52,6 +55,13 @@ def main():
         cursor.execute("UPDATE training_jobs SET status = 'running', started_at = ? WHERE job_id = ?", (now_str, args.job_id))
         conn.commit()
         print(f"[{args.job_id}] 실제 PyTorch 백그라운드 학습 시작 (Epoch: {args.epoch}, Batch: {args.batch_size}, Type: {args.job_type})", flush=True)
+
+        # 0. 이전 실패 등으로 존재할 수 있는 동일 버전의 불완전한 모델 디렉토리 정리 (새출발)
+        target_dir = f"./model/kanana-safeguard-finetuned-{args.target_version}"
+        if os.path.exists(target_dir):
+            print(f"[{args.job_id}] ⚠️ 이전 실패 이력이 있어 존재하는 불완전한 모델 폴더 '{target_dir}'를 정리하고 새롭게 학습을 진행합니다.", flush=True)
+            import shutil
+            shutil.rmtree(target_dir, ignore_errors=True)
 
         # 1. 모델 / 토크나이저 준비
         if args.job_type == "retrain":
@@ -119,6 +129,69 @@ def main():
             model.train()
             optimizer.zero_grad()
             for step, batch in enumerate(train_loader):
+                # [GPU 자원 관리] 추론/평가 요청 시 자원을 양보하기 위한 일시정지 체크
+                LOCK_DIR = ".gpu_locks"
+                if not os.path.exists(LOCK_DIR): os.makedirs(LOCK_DIR)
+                
+                if os.listdir(LOCK_DIR):
+                    print(f"[{args.job_id}] ⚠️ 실시간 추론/평가 요청(총 {len(os.listdir(LOCK_DIR))}건)으로 인해 GPU 자원을 양보합니다. (Pause)", flush=True)
+                    
+                    # 1. 모델과 옵티마이저 상태를 CPU로 이동하여 VRAM 확보
+                    model.cpu()
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cpu()
+                    
+                    # 2. 잔여 메모리 강제 해제
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
+                    # DB 상태를 잠시 'paused'로 변경
+                    try:
+                        temp_conn = sqlite3.connect('jobs.db', timeout=5)
+                        temp_conn.execute("UPDATE training_jobs SET status = 'paused' WHERE job_id = ?", (args.job_id,))
+                        temp_conn.commit()
+                        temp_conn.close()
+                    except: pass
+                    
+                    # 모든 락 파일이 사라질 때까지 대기
+                    while os.listdir(LOCK_DIR):
+                        time.sleep(1.0)
+                        
+                    print(f"[{args.job_id}] 락 해제 감지. 이전 프로세스의 VRAM 해제를 위해 5초간 대기합니다...", flush=True)
+                    time.sleep(5.0)
+                    
+                    # 3. 모델과 옵티마이저 상태를 다시 GPU(device)로 복구 (OOM 방어 재시도 로직 적용)
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            print(f"[{args.job_id}] GPU 자원 재점유 시도 중 ({attempt+1}/{max_retries})...", flush=True)
+                            model.to(device)
+                            for state in optimizer.state.values():
+                                for k, v in state.items():
+                                    if isinstance(v, torch.Tensor):
+                                        state[k] = v.to(device)
+                            print(f"[{args.job_id}] ✅ GPU 자원 재점유 완료! (Resume)", flush=True)
+                            break
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                print(f"[{args.job_id}] ⚠️ GPU 재점유 중 OOM 감지. 캐시 정리 후 5초 뒤 재시도합니다: {e}", flush=True)
+                                torch.cuda.empty_cache()
+                                gc.collect()
+                                time.sleep(5.0)
+                                if attempt == max_retries - 1:
+                                    raise e
+                            else:
+                                raise e
+                    
+                    try:
+                        temp_conn = sqlite3.connect('jobs.db', timeout=5)
+                        temp_conn.execute("UPDATE training_jobs SET status = 'running' WHERE job_id = ?", (args.job_id,))
+                        temp_conn.commit()
+                        temp_conn.close()
+                    except: pass
+
                 outputs = model(
                     input_ids=batch["input_ids"].to(device), 
                     attention_mask=batch["attention_mask"].to(device), 

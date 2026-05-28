@@ -12,7 +12,37 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 load_dotenv()  # .env 파일 로드
 
+import asyncio
+from contextlib import asynccontextmanager
 import database
+
+# GPU 자원 경합 방지를 위한 락 디렉토리 설정
+LOCK_DIR = ".gpu_locks"
+if not os.path.exists(LOCK_DIR):
+    os.makedirs(LOCK_DIR)
+
+@asynccontextmanager
+async def gpu_resource_lock(task_id: str):
+    """
+    학습 중인 프로세스가 있을 경우, GPU 자원을 비우도록 신호를 보내고 
+    작업이 끝날 때까지 대기시키는 컨텍스트 매니저
+    """
+    lock_file = os.path.join(LOCK_DIR, f"lock_{task_id}")
+    try:
+        # 락 파일 생성 (학습 프로세스 감지용)
+        with open(lock_file, "w") as f:
+            f.write(task_id)
+        
+        # 처음 락을 거는 경우라면 학습 프로세스가 모델을 CPU로 옮길 시간을 벌어줌 (약 2초)
+        # 이미 다른 락이 있다면 이미 Pause 상태일 것이므로 즉시 진행
+        if len(os.listdir(LOCK_DIR)) <= 1:
+            await asyncio.sleep(2.0)
+            
+        yield
+    finally:
+        # 작업 종료 후 락 제거
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
 
 app = FastAPI(title="Risk Detection API")
 
@@ -20,6 +50,15 @@ app = FastAPI(title="Risk Detection API")
 def startup_event():
     database.init_db()
     print("[시스템] SQLite 데이터베이스 연결 및 (통합)초기화 완료")
+
+def check_active_training(cursor):
+    """현재 진행 중인(running, paused, queued) 학습 작업이 있는지 확인"""
+    cursor.execute("""
+        SELECT job_id, status FROM training_jobs 
+        WHERE status IN ('running', 'paused', 'queued')
+        LIMIT 1
+    """)
+    return cursor.fetchone()
 
 @app.get("/health")
 async def health_check():
@@ -43,10 +82,23 @@ async def request_training_job(req: TrainingRequest):
     
     conn = database.get_connection()
     cursor = conn.cursor()
+    
+    # 중복 학습 방지 체크
+    active_job = check_active_training(cursor)
+    if active_job:
+        conn.close()
+        return {
+            "content_type": "json",
+            "result_code": 400,
+            "result_msg": "A training job is already in progress.",
+            "job_id": active_job['job_id'],
+            "status": active_job['status']
+        }
+    
     cursor.execute("""
-        INSERT INTO training_jobs (job_id, job_type, dataset_version, epoch, batch_size, learning_rate, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, 'train', req.dataset_version, req.epoch, req.batch_size, req.learning_rate, "queued"))
+        INSERT INTO training_jobs (job_id, job_type, dataset_version, epoch, batch_size, learning_rate, status, model_name, version, progress)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'kanana-risk-detector', ?, 0.0)
+    """, (job_id, 'train', req.dataset_version, req.epoch, req.batch_size, req.learning_rate, "queued", req.target_version))
     conn.commit()
     conn.close()
 
@@ -82,8 +134,8 @@ async def get_training_job_status(job_id: Optional[str] = None):
     if job_id:
         cursor.execute("SELECT * FROM training_jobs WHERE job_id = ?", (job_id,))
     else:
-        # ID가 없는 경우 가장 최근 학습 이력 1건 조회 (진행중/완료 무관)
-        cursor.execute("SELECT * FROM training_jobs ORDER BY ROWID DESC LIMIT 1")
+        # ID가 없는 경우 가장 최근 학습 이력 1건 조회 (진행중/완료, 단 실패 제외)
+        cursor.execute("SELECT * FROM training_jobs WHERE status != 'failed' ORDER BY ROWID DESC LIMIT 1")
         
     row = cursor.fetchone()
     conn.close()
@@ -99,7 +151,7 @@ async def get_training_job_status(job_id: Optional[str] = None):
         "job_id": row["job_id"],
         "dataset_version": row["dataset_version"],
         "status": row["status"],
-        "progress_percent": dict(row).get("progress", 0.0) if row["status"] != "completed" else 100.0,
+        "progress_percent": (row["progress"] if row["progress"] is not None else 0.0) if row["status"] != "completed" else 100.0,
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "model_name": row["model_name"],
@@ -182,8 +234,8 @@ async def get_training_history(page: int = 1, page_size: int = 20):
             h = int(hashlib.md5(j_id.encode()).hexdigest(), 16)
             try:
                 dt = datetime.datetime.strptime(t_date, "%Y-%m-%dT%H:%M:%S")
-                # Add minutes offset to differentiate identical started_at times for multiple identical jobs
-                dt += datetime.timedelta(minutes=((h % 300) + 1))
+                # Add seconds offset to differentiate identical started_at times for multiple identical jobs
+                dt += datetime.timedelta(seconds=((h % 60) + 1))
                 display_date = dt.strftime("%Y-%m-%dT%H:%M:%S")
             except:
                 pass
@@ -194,7 +246,7 @@ async def get_training_history(page: int = 1, page_size: int = 20):
             "dataset": row["dataset"],
             "f1_score": round(row["f1_score"], 4) if row["f1_score"] is not None else None,
             "status": row["status"],
-            "progress_percent": row["progress_percent"] if row["status"] != "completed" else 100.0
+            "progress_percent": (row["progress_percent"] if row["progress_percent"] is not None else 0.0) if row["status"] != "completed" else 100.0
         })
 
     import math
@@ -224,7 +276,7 @@ class RetrainingRequest(BaseModel):
     to_date: Optional[str] = None
     include_feedback: bool = False
     retraining_reason: Optional[str] = "No reason provided"
-    epoch: int = 2
+    epoch: int = 4
     batch_size: int = 8
     learning_rate: float = 0.00005
 
@@ -236,6 +288,18 @@ async def request_retraining_job(req: RetrainingRequest):
     
     conn = database.get_connection()
     cursor = conn.cursor()
+
+    # 중복 학습 방지 체크
+    active_job = check_active_training(cursor)
+    if active_job:
+        conn.close()
+        return {
+            "content_type": "json",
+            "result_code": 400,
+            "result_msg": "A training job is already in progress.",
+            "job_id": active_job['job_id'],
+            "status": active_job['status']
+        }
     
     # base_version 자동 선택 로직 (입력 없을 시 f1_score가 가장 높은 모델)
     base_version = req.base_version
@@ -269,8 +333,8 @@ async def request_retraining_job(req: RetrainingRequest):
         else:
             prefix = base_version
             
-        # 2. 해당 접두사로 시작하는 모든 버전 조회
-        cursor.execute("SELECT version FROM training_jobs WHERE version LIKE ?", (f"{prefix}%",))
+        # 2. 해당 접두사로 시작하는 모든 성공적으로 완료된 버전 조회
+        cursor.execute("SELECT version FROM training_jobs WHERE version LIKE ? AND status = 'completed'", (f"{prefix}%",))
         rows = cursor.fetchall()
         
         max_patch = 0
@@ -316,13 +380,13 @@ async def request_retraining_job(req: RetrainingRequest):
         INSERT INTO training_jobs (
             job_id, job_type, dataset_version, base_version, from_date, to_date, 
             include_feedback, retraining_reason, status,
-            epoch, batch_size, learning_rate
+            epoch, batch_size, learning_rate, model_name, version, progress
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'kanana-risk-detector', ?, 0.0)
     """, (
         job_id, 'retrain', dataset_version, base_version, req.from_date, req.to_date,
         req.include_feedback, req.retraining_reason, "queued",
-        req.epoch, req.batch_size, req.learning_rate
+        req.epoch, req.batch_size, req.learning_rate, target_version
     ))
     conn.commit()
     conn.close()
@@ -369,21 +433,61 @@ async def evaluate_risk_detection(req: EvaluationRequest):
     conn = database.get_connection()
     cursor = conn.cursor()
     
-    # version이나 dataset_version이 없을 경우 가장 최근의 성공한 평가 파라미터 사용
+    # version이나 dataset_version이 없을 경우 혹은 지정한 버전이 학습 중인 경우
+    # 가장 최근 '학습 완료'된 모델을 기준으로 선택
+    final_version = req.version
+    final_dataset_version = req.dataset_version
     reference_eval_id = None
-    if not req.version or not req.dataset_version:
-        cursor.execute("SELECT evaluation_id, version, dataset_version FROM evaluations WHERE status = 'completed' AND passed = 1 ORDER BY ROWID DESC LIMIT 1")
-        last_success = cursor.fetchone()
-        if not last_success:
-            conn.close()
-            raise HTTPException(status_code=400, detail="이전 성공 이력이 없어 version과 dataset_version을 생략할 수 없습니다.")
+
+    # 지정한 버전이 현재 학습 중인지 확인
+    is_currently_training = False
+    if final_version:
+        cursor.execute("SELECT 1 FROM training_jobs WHERE version = ? AND status IN ('running', 'queued')", (final_version,))
+        if cursor.fetchone():
+            is_currently_training = True
+
+    if not final_version or not final_dataset_version or is_currently_training:
+        if is_currently_training:
+            print(f"[평가 API] 요청된 버전 '{final_version}'이 현재 학습 진행 중이므로, 완료된 가장 최근 버전을 사용합니다.")
+            final_version = None  # 학습 완료된 다른 버전을 선택하도록 초기화
             
-        final_version = req.version if req.version else last_success["version"]
-        final_dataset_version = req.dataset_version if req.dataset_version else last_success["dataset_version"]
-        reference_eval_id = last_success["evaluation_id"]
-    else:
-        final_version = req.version
-        final_dataset_version = req.dataset_version
+        cursor.execute("""
+            SELECT version, dataset_version 
+            FROM training_jobs 
+            WHERE status = 'completed' 
+              AND version NOT IN (
+                  SELECT version FROM training_jobs WHERE status IN ('running', 'queued') AND version IS NOT NULL
+              )
+            ORDER BY finished_at DESC LIMIT 1
+        """)
+        last_train = cursor.fetchone()
+        
+        if last_train:
+            if not final_version:
+                final_version = last_train["version"]
+            if not final_dataset_version:
+                final_dataset_version = last_train["dataset_version"]
+        else:
+            # 학습 이력이 전혀 없는 경우 기존 방식대로 평가 성공 이력에서 탐색 (현재 학습 중인 버전은 제외)
+            cursor.execute("""
+                SELECT evaluation_id, version, dataset_version 
+                FROM evaluations 
+                WHERE status = 'completed' AND passed = 1 
+                  AND version NOT IN (
+                      SELECT version FROM training_jobs WHERE status IN ('running', 'queued') AND version IS NOT NULL
+                  )
+                ORDER BY ROWID DESC LIMIT 1
+            """)
+            last_eval = cursor.fetchone()
+            if last_eval:
+                if not final_version:
+                    final_version = last_eval["version"]
+                if not final_dataset_version:
+                    final_dataset_version = last_eval["dataset_version"]
+                reference_eval_id = last_eval["evaluation_id"]
+            else:
+                conn.close()
+                raise HTTPException(status_code=400, detail="학습 혹은 평가 성공 이력이 없어 version과 dataset_version을 생략할 수 없습니다.")
 
     cursor.execute("""
         INSERT INTO evaluations (evaluation_id, version, dataset_version, status)
@@ -398,6 +502,7 @@ async def evaluate_risk_detection(req: EvaluationRequest):
         "--version", final_version,
         "--dataset_version", final_dataset_version
     ]
+    # Evaluation worker 실행 (Worker 내부에서 자체적으로 GPU Lock을 관리함)
     subprocess.Popen(cmd)
 
     response = {
@@ -422,8 +527,16 @@ async def get_evaluation_result(evaluation_id: Optional[str] = None):
     if evaluation_id:
         cursor.execute("SELECT * FROM evaluations WHERE evaluation_id = ?", (evaluation_id,))
     else:
-        # ID가 없는 경우 가장 최근 평가 이력 1건 조회 (ROWID를 사용하여 삽입 순서대로 정렬)
-        cursor.execute("SELECT * FROM evaluations ORDER BY ROWID DESC LIMIT 1")
+        # 학습이 성공한 최신 버전의 모델에 대한 평가 현황 1건 조회
+        cursor.execute("""
+            SELECT * FROM evaluations 
+            WHERE version = (
+                SELECT version FROM training_jobs 
+                WHERE status = 'completed' 
+                ORDER BY finished_at DESC LIMIT 1
+            )
+            ORDER BY ROWID DESC LIMIT 1
+        """)
         
     row = cursor.fetchone()
     conn.close()
@@ -451,7 +564,7 @@ async def get_evaluation_result(evaluation_id: Optional[str] = None):
 # =========================================
 class InferenceRequest(BaseModel):
     content: str
-    version: str = "v1.1"
+    version: Optional[str] = None
 
 @app.post("/ai/inference/risk-detection")
 async def infer_risk_detection(req: InferenceRequest):
@@ -459,29 +572,83 @@ async def infer_risk_detection(req: InferenceRequest):
     
     print("[추론 API] 추론 요청 수신. 공용 서버 정책에 따라 단발성 스크립트를 띄웁니다...")
     
-    # inference_worker.py를 subprocess로 실행하여 모델을 켜고, 끝나면 OS가 즉시 메모리를 해제함.
-    proc = subprocess.run(
-        ["python", "src/inference_worker.py", req.content, req.version], 
-        capture_output=True, 
-        text=True
-    )
+    version = req.version
     
-    # 출력된 문자열(stdout)의 마지막 줄에서 결과(SAFE/UNSAFE) 추출
-    out_text = proc.stdout.strip()
-    prediction = "UNSAFE" if "UNSAFE" in out_text else "SAFE"
+    # 지정한 버전이 현재 학습 중인지 확인
+    is_currently_training = False
+    if version:
+        conn = database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM training_jobs WHERE version = ? AND status IN ('running', 'queued')", (version,))
+        if cursor.fetchone():
+            is_currently_training = True
+        conn.close()
+
+    if not version or is_currently_training:
+        conn = database.get_connection()
+        cursor = conn.cursor()
+        if is_currently_training:
+            print(f"[추론 API] 요청된 버전 '{version}'이 현재 학습 진행 중이므로, 완료된 가장 성능 좋은 버전을 자동 선택합니다.")
+            version = None
+            
+        # 가장 성능이 좋은 모델 버전을 찾습니다 (F1-score 기준, 현재 학습 중인 버전 제외)
+        cursor.execute("""
+            SELECT version 
+            FROM evaluations
+            WHERE f1_score IS NOT NULL AND status = 'completed'
+              AND version NOT IN (
+                  SELECT version FROM training_jobs WHERE status IN ('running', 'queued') AND version IS NOT NULL
+              )
+            ORDER BY ROUND(f1_score, 3) DESC, recall DESC, ROWID DESC 
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if row and row["version"]:
+            version = row["version"]
+        else:
+            # 평가 이력이 없는 경우, 학습 완료된 최신 버전을 가져옵니다 (현재 학습 중인 버전 제외).
+            cursor.execute("""
+                SELECT version FROM training_jobs 
+                WHERE status='completed' 
+                  AND version NOT IN (
+                      SELECT version FROM training_jobs WHERE status IN ('running', 'queued') AND version IS NOT NULL
+                  )
+                ORDER BY finished_at DESC LIMIT 1
+            """)
+            row_fallback = cursor.fetchone()
+            if row_fallback and row_fallback["version"]:
+                version = row_fallback["version"]
+            else:
+                version = "v1.1" # 기본 폴백
+        conn.close()
+        print(f"[추론 API] 버전을 결정했습니다: '{version}'")
+
+    now = datetime.datetime.now()
+    async with gpu_resource_lock(f"inf_{now.strftime('%H%M%S')}"):
+        # inference_worker.py를 subprocess로 실행하여 모델을 켜고, 끝나면 OS가 즉시 메모리를 해제함.
+        proc = subprocess.run(
+            ["python", "src/inference_worker.py", req.content, version], 
+            capture_output=True, 
+            text=True
+        )
+        
+        # 출력된 문자열(stdout)의 마지막 줄에서 결과(SAFE/UNSAFE) 추출
+        out_text = proc.stdout.strip()
+        prediction = "UNSAFE" if "UNSAFE" in out_text else "SAFE"
     
     return {
         "content_type": "json",
         "result_code": 200,
         "result_msg": "success",
-        "prediction": prediction
+        "prediction": prediction,
+        "version": version
     }
 
 # =========================================
 # 7. 외부 거대언어모델(LLM) API 연동 추론
 # =========================================
 
-EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "http://cellm.gachon.ac.kr:8080/v1/chat/completions")
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")
 TEAM_KEY = os.getenv("TEAM_KEY")
 
 class RecommendRequest(BaseModel):
